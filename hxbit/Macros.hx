@@ -2154,9 +2154,13 @@ class Macros {
 				var conds = new haxe.EnumFlags<Condition>();
 				conds.set(PreventCDB);
 				conds.set(IsParam);
-				for( m in r.f.meta )
+				var visibility : Null<Int> = null;
+				for( m in r.f.meta ) {
 					if( m.name == ":allowCDB" )
 						conds.unset(PreventCDB);
+					if( m.name == ":visible" )
+						visibility = getVisibility(m);
+				}
 
 				if( returnVal.value || returnVal.call ) {
 					var typeValue;
@@ -2192,7 +2196,7 @@ class Macros {
 				}
 
 				var forwardRPC = macro {
-					@:privateAccess __host.doRPC(this,$v{id},$resultCall, function(__ctx) {
+					@:privateAccess __host.doRPC(this,$v{id}, $v{visibility},$resultCall, function(__ctx) {
 						$b{[
 							for( a in funArgs )
 								withPos(macro hxbit.Macros.serializeValue(__ctx, $i{a.name}), f.expr.pos)
@@ -2267,6 +2271,7 @@ class Macros {
 					}
 				case Immediate:
 					macro {
+						var vs = $v{visibility};
 						if( __host != null ) {
 							if( !__host.isAuth && !networkAllow(Ownership, $v{id}, __host.self.ownerObject) ) {
 								var fieldName = networkGetName($v{id}, true);
