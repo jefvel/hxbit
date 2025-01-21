@@ -2154,7 +2154,7 @@ class Macros {
 				var conds = new haxe.EnumFlags<Condition>();
 				conds.set(PreventCDB);
 				conds.set(IsParam);
-				var visibility : Null<Int> = null;
+				var visibilityMask = 0;
 				for( m in r.f.meta ) {
 					if( m.name == ":allowCDB" )
 						conds.unset(PreventCDB);
