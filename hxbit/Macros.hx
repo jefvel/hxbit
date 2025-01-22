@@ -2159,7 +2159,7 @@ class Macros {
 					if( m.name == ":allowCDB" )
 						conds.unset(PreventCDB);
 					if( m.name == ":visible" )
-						visibility = getVisibility(m);
+						visibilityMask |= 1 << getVisibility(m);
 				}
 
 				if( returnVal.value || returnVal.call ) {
@@ -2196,7 +2196,7 @@ class Macros {
 				}
 
 				var forwardRPC = macro {
-					@:privateAccess __host.doRPC(this,$v{id}, $v{visibility}, $resultCall, function(__ctx) {
+					@:privateAccess __host.doRPC(this,$v{id}, $v{visibilityMask}, $resultCall, function(__ctx) {
 						$b{[
 							for( a in funArgs )
 								withPos(macro hxbit.Macros.serializeValue(__ctx, $i{a.name}), f.expr.pos)
