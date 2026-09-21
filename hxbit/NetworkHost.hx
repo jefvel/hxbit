@@ -762,7 +762,9 @@ class NetworkHost {
 	}
 
 	function objStr(o:NetworkSerializable) {
-		return o + "#" + #if hxbit64 StringTools.hex(o.__uid.high)+StringTools.hex(o.__uid.low, 8) #else o.__uid #end;
+		var className = #if !hxnodejs o #else Type.getClassName(Type.getClass(o)) #end;
+		var res = className + "#" + #if hxbit64 StringTools.hex(o.__uid.high)+StringTools.hex(o.__uid.low, 8) #else o.__uid #end;
+		return res;
 	}
 
 	public inline function addAliveEvent(f) {
