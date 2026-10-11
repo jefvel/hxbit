@@ -49,12 +49,11 @@ class ArrayProxyIterator<T> {
 	public inline function next() return a[index++];
 }
 
+@:forward(length)
 abstract ArrayProxy<T>(ArrayProxyData<T>) to ProxyChild {
 
 	@:noCompletion public var __value(get, never) : Array<T>;
-	public var length(get, never) : Int;
 	inline function get___value() : Array<T> return this == null ? null : this.array;
-	inline function get_length() return this.array.length;
 
 	inline function new(a) {
 		this = a;
@@ -66,6 +65,10 @@ abstract ArrayProxy<T>(ArrayProxyData<T>) to ProxyChild {
 
 	public function copy() {
 		return new ArrayProxy(new ArrayProxyData(this.array.copy()));
+	}
+
+	public inline function getArray() {
+		return __value;
 	}
 
 	public function filter( t : T->Bool ) {
@@ -190,15 +193,18 @@ abstract ArrayProxy<T>(ArrayProxyData<T>) to ProxyChild {
 	}
 }
 
+@:forward(length)
 abstract ArrayProxy2<T:ProxyChild>(ArrayProxyData<T>) to ProxyChild {
 
 	@:noCompletion public var __value(get, never) : Array<T>;
-	public var length(get, never) : Int;
 	inline function get___value() : Array<T> return this == null ? null : this.array;
-	inline function get_length() return this.array.length;
 
 	inline function new(a) {
 		this = a;
+	}
+
+	public inline function getArray() {
+		return __value;
 	}
 
 	inline function bind(v:T) {
@@ -221,6 +227,10 @@ abstract ArrayProxy2<T:ProxyChild>(ArrayProxyData<T>) to ProxyChild {
 		return this.array.filter(t);
 	}
 
+	public inline function contains( x : T ) : Bool {
+		return this.array.contains(x);
+	}
+	
 	public inline function indexOf(x:T, ?fromIndex) {
 		return this.array.indexOf(x, fromIndex);
 	}
@@ -322,6 +332,10 @@ abstract ArrayProxy2<T:ProxyChild>(ArrayProxyData<T>) to ProxyChild {
 	@:noCompletion public inline function bindHost(o,bit) {
 		this.obj = o;
 		this.bit = bit;
+	}
+
+	@:noCompletion public inline function unbindHost() {
+		this.obj = null;
 	}
 
 	@:arrayAccess inline function get(idx:Int) {

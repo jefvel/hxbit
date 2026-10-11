@@ -54,6 +54,10 @@ enum RpcMode {
 		When called on the server: will forward the call to the clients (and force its execution), then execute.
 	*/
 	Immediate;
+	/*
+		Variant of @:rpc(server) that also generates check{Name} and can{Name} functions that skip execution of code within @:do { } blocks.
+	*/
+	Checked;
 }
 
 enum PropTypeDesc<PropType> {
@@ -76,9 +80,12 @@ enum PropTypeDesc<PropType> {
 	PFlags( t : PropType );
 	PCustom;
 	PSerInterface( name : String );
-	PStruct( name : String, fields : Array<{ name : String, type : PropType }> );
+	POldStruct( name : String, fields : Array<{ name : String, type : PropType }> );
 	PAliasCDB( k : PropType );
 	PNoSave( k : PropType );
+	PStruct( name : String );
+	PDouble;
+	PRPC( mode : RpcMode, args : Array<PropType>, ret : PropType );
 }
 
 typedef PropType = {
@@ -95,6 +102,7 @@ typedef PropType = {
 private enum Condition {
 	PartialResolution;
 	PreventCDB;
+	IsParam;
 }
 
 class Macros {
@@ -106,12 +114,21 @@ class Macros {
 	/** Generate game-specific property getters, mostly to be used in networkAllow() **/
 	public static var CUSTOM_GETTERS : Array<{name: String, ret: ComplexType, func : {id: Int, name: String, field: Field} -> Dynamic }> = [];
 
-	@:persistent static var NW_BUILD_STACK : Array<String> = [];
+	@:persistent static var SERIALIZABLES : Map<String,String> = [];
+	@:persistent static var UNSERIALIZABLES : Map<String,Bool> = [];
 
 	#if macro
 	public static function markAsSerializable( className : String ) {
-		NW_BUILD_STACK.push(className);
+		SERIALIZABLES.set(className, className);
 	}
+	public static function markAsUnserializable( className : String, dataOnly=false ) {
+		UNSERIALIZABLES.set(className, dataOnly);
+	}
+
+	public static dynamic function wrapRPC( rpc : { mode : RpcMode, f : Field }, doCall : haxe.macro.Expr, id : Int ) {
+		return doCall;
+	}
+
 	#end
 
 	public static function initVisibility(vis) {
@@ -127,6 +144,7 @@ class Macros {
 	public static macro function serializeValue( ctx : Expr, v : Expr ) : Expr {
 		var t = Context.typeof(v);
 		var conds = new haxe.EnumFlags<Condition>();
+		conds.set(IsParam); // force always (only check in unserialize)
 		var pt = getPropType(t, conds);
 		if( pt == null ) {
 			Context.error("Unsupported serializable type " + t.toString(), v.pos);
@@ -156,7 +174,7 @@ class Macros {
 				}
 			}
 		}
-		return withPos(unserializeExpr(ctx, v, pt, depth, conds),v.pos);
+		return withPos(unserializeExpr(ctx, v, pt, depth, conds), v.pos);
 	}
 
 	public static macro function markValue( v : Expr ) : Expr {
@@ -193,6 +211,35 @@ class Macros {
 		return macro $v{v};
 	}
 
+	public static macro function getRPCFieldType( v : Expr, rpcMode : Int ) {
+		var t = Context.typeof(v);
+		var conds = new haxe.EnumFlags<Condition>();
+		conds.set(IsParam);
+		var pt : PropType = switch( t ) {
+		case TFun(args, ret):
+			var ret = switch( ret ) {
+			case TAbstract(a,_) if( a.toString() == "Void" ): null;
+			default: getPropType(ret,conds);
+			}
+			if( ret == null && args.length > 0 && args[args.length-1].name == "__return" ) {
+				var a = args[args.length-1];
+				ret = switch( a.t ) {
+				case TFun([v],_): args.pop(); getPropType(v.t,conds);
+				default: throw "assert";
+				}
+			}
+			{ d : PRPC(RpcMode.createByIndex(rpcMode),[for( a in args ) {
+				var at = getPropType(a.t,conds);
+				if( at == null ) Context.error(haxe.macro.ExprTools.toString(v)+a.name+" is not serializable", v.pos);
+				at;
+			}],ret), t : null };
+		default:
+			throw "assert";
+		}
+		var v = toFieldType(pt);
+		return macro $v{v};
+	}
+
 	public static function iterType<T>( t : PropTypeDesc<T>, f : T -> Void ) {
 		switch( t ) {
 		case PMap(k, v):
@@ -213,7 +260,31 @@ class Macros {
 		}
 	}
 
+	public static macro function checkSuccess(e: Expr): Expr {
+		var t = Context.typeof(e);
+		switch(t) {
+		case TEnum(_):
+			var v = getSuccessVal(t);
+			return v == null ? macro $e == cast null : macro $e == $v;
+		default:
+			if(!Context.unify(t, Context.typeof(macro true)))
+				Context.error("Checked value must unify with Bool, got " + t.toString(), e.pos);
+			return e;
+		}
+	}
+
 	#if macro
+
+	static function getSuccessVal( t : haxe.macro.Type ) : Expr {
+		switch( Context.follow(t) ) {
+		case TEnum(en, _):
+			for( m in en.get().meta.get() )
+				if( m.name == ":rpcSuccess" && m.params.length > 0 )
+					return m.params[0];
+		default:
+		}
+		return null;
+	}
 
 	static function toFieldType( t : PropType ) : Schema.FieldType {
 		return switch( t.d ) {
@@ -223,6 +294,7 @@ class Macros {
 		case PBool: PBool;
 		case PString: PString;
 		case PBytes: PBytes;
+		case PDouble: PDouble;
 		case PSerializable(name): PSerializable(name);
 		case PEnum(name): PEnum(name);
 		case PMap(k, v): PMap(toFieldType(k), toFieldType(v));
@@ -236,13 +308,19 @@ class Macros {
 		case PUnknown: PUnknown;
 		case PDynamic: PDynamic;
 		case PSerInterface(name): PSerInterface(name);
-		case PStruct(name, fields): PStruct(name,[for( f in fields ) { name : f.name, type : toFieldType(f.type) }]);
+		case PStruct(name): PStruct(name);
+		case PRPC(mode,args,ret): PRPC(mode,[for( v in args ) toFieldType(v)], ret == null ? null : toFieldType(ret));
+		case POldStruct(_): throw "assert";
 		};
+	}
+
+	static inline function getClass( c : Ref<ClassType> ) {
+		return c.get();
 	}
 
 	static function lookupInterface( c : Ref<ClassType>, name : String ) {
 		while( true ) {
-			var cg = c.get();
+			var cg = getClass(c);
 			for( i in cg.interfaces ) {
 				if( i.t.toString() == name )
 					return true;
@@ -258,7 +336,8 @@ class Macros {
 	}
 
 	static function isSerializable( c : Ref<ClassType> ) {
-		return NW_BUILD_STACK.indexOf(c.toString()) >= 0 || c.get().meta.has(":isSerializable") || lookupInterface(c, "hxbit.Serializable");
+		var path = c.toString();
+		return SERIALIZABLES.exists(path) || getClass(c).meta.has(":isSerializable") || lookupInterface(c, "hxbit.Serializable");
 	}
 
 	static function isCustomSerializable( c : Ref<ClassType> ) {
@@ -285,6 +364,7 @@ class Macros {
 			} else
 				return idx;
 		default:
+			Context.error("Invalid visibility value", m.params[0].pos);
 		}
 		return null;
 	}
@@ -361,11 +441,17 @@ class Macros {
 		var isMutable = true;
 		var desc = switch( t ) {
 		case TAbstract(a, pl):
-			switch( a.toString() ) {
-			case "haxe.Int64", "hl.I64":
+			var path = a.toString();
+			var v = UNSERIALIZABLES.get(path);
+			if( v != null && (!v || !conds.has(IsParam)) )
+				return null;
+			switch( path ) {
+			case "haxe.Int64", "hl.I64", "hl.GUID":
 				PInt64;
 			case "Float", "Single":
 				PFloat;
+			case "hxbit.Double":
+				PDouble;
 			case "Int","UInt":
 				PInt;
 			case "Bool":
@@ -414,13 +500,10 @@ class Macros {
 					p = { d : PNull(p), t : TPath( { pack : [], name : "Null", params : [TPType(p.t)] } ) };
 				return p;
 			case name:
-				var t2 = Context.followWithAbstracts(t, true);
-				switch( t2 ) {
-				case TAbstract(a2, _) if( a2.toString() == name ):
+				var ainf = a.get();
+				if( ainf.type == null )
 					return null;
-				default:
-				}
-				var ainf = a.get(), isCDB = false;
+				var isCDB = false;
 				if( ainf.meta.has(":cdb") ) {
 					if( conds.has(PreventCDB) ) {
 						Context.warning("Unsupported CDB type, store the id-kind or use @:allowCDB ", Context.currentPos());
@@ -430,7 +513,13 @@ class Macros {
 					isMutable = false;
 				} else if( ainf.meta.has(":noProxy") )
 					isMutable = false;
-				var pt = getPropType(t2,conds);
+				var subt = ainf.type.applyTypeParameters(ainf.params,pl);
+				switch( subt ) {
+				case TAbstract(a2,_) if( a2.toString() == path ):
+					return null;
+				default:
+				}
+				var pt = getPropType(subt,conds);
 				if( pt == null ) return null;
 				isCDB ? PAliasCDB(pt) : PAlias(pt);
 			}
@@ -476,7 +565,7 @@ class Macros {
 			case "haxe.io.Bytes":
 				PBytes;
 			case name if( StringTools.startsWith(name, "hxbit.ObjProxy_") ):
-				var fields = c.get().fields.get();
+				var fields = getClass(c).fields.get();
 				for( f in fields )
 					if( f.name == "__value" ) {
 						var t = getPropType(f.type,conds);
@@ -487,25 +576,25 @@ class Macros {
 				throw "assert";
 			default:
 				if( isSerializable(c) ) {
-					var c = c.get();
-					var path = getNativePath(c);
-					c.isInterface ? PSerInterface(path) : PSerializable(path);
+					var path, isInt;
+					path = c.toString();
+					if( SERIALIZABLES.exists(path) ) {
+						path = SERIALIZABLES.get(path);
+						isInt = false;
+					} else {
+						var c = getClass(c);
+						path = getNativePath(c);
+						isInt = c.isInterface;
+					}
+					isInt ? PSerInterface(path) : PSerializable(path);
 				} else if( isCustomSerializable(c) )
 					PCustom;
 				else if( isStructSerializable(c) ) {
-					var c = c.get();
+					var c = getClass(c);
 					var path = getNativePath(c);
-					var fields = [];
-					for( f in c.fields.get() ) {
-						if( !f.meta.has(":s") ) continue;
-						var t = getPropField(f.type, f.meta.get(), conds);
-						if( t == null )
-							return null;
-						fields.push({ name : f.name, type : t });
-					}
 					if( c.meta.has(":isProxy") )
 						isProxy = true;
-					PStruct(path, fields);
+					PStruct(path);
 				} else
 					return null;
 			}
@@ -571,6 +660,8 @@ class Macros {
 			return macro $ctx.addInt64($v);
 		case PFloat:
 			return macro $ctx.addFloat($v);
+		case PDouble:
+			return macro $ctx.addDouble($v);
 		case PInt:
 			return macro $ctx.addInt($v);
 		case PBool:
@@ -650,7 +741,7 @@ class Macros {
 				else
 					v.serialize($ctx);
 			}
-		case PUnknown:
+		case PUnknown, POldStruct(_), PRPC(_):
 			throw "assert";
 		}
 	}
@@ -661,6 +752,8 @@ class Macros {
 			return macro $v = $ctx.getInt64();
 		case PFloat:
 			return macro $v = $ctx.getFloat();
+		case PDouble:
+			return macro $v = $ctx.getDouble();
 		case PInt:
 			return macro $v = $ctx.getInt();
 		case PBool:
@@ -698,15 +791,15 @@ class Macros {
 						var vars = [];
 						for( f in fields ) {
 							var nidx = nullables.indexOf(f);
-							var name = f.name;
+							var name = f.name+"_";
 							var ct = f.type.t;
-							vars.push( { field : name, expr : { expr : EConst(CIdent(name)), pos:v.pos } } );
+							vars.push( { field : f.name, expr : { expr : EConst(CIdent(name)), pos:v.pos } } );
 							if( nidx < 0 ) {
 								exprs.unshift(macro var $name : $ct);
-								exprs.push(macro hxbit.Macros.unserializeValue($ctx, $i{name}, $v{depth+1}, $v{conds.toInt()}));
+								exprs.push(macro hxbit.Macros.unserializeValue($ctx, @:pos(v.pos) $i{name}, $v{depth+1}, $v{conds.toInt()}));
 							} else {
 								exprs.unshift(macro var $name : $ct = null);
-								exprs.push(macro if( fbits & $v { 1 << nidx } != 0 ) hxbit.Macros.unserializeValue($ctx, $i{name}, $v{depth+1}, $v{conds.toInt()}));
+								exprs.push(macro if( fbits & $v { 1 << nidx } != 0 ) hxbit.Macros.unserializeValue($ctx, @:pos(v.pos) $i{name}, $v{depth+1}, $v{conds.toInt()}));
 							}
 						}
 						exprs.push( { expr : EBinop(OpAssign,v, { expr : EObjectDecl(vars), pos:v.pos } ), pos:v.pos } );
@@ -722,7 +815,7 @@ class Macros {
 			var ename = "e" + depth;
 			return macro {
 				var $ename : $at;
-				$v = $ctx.getArray(function() { hxbit.Macros.unserializeValue($ctx, $i{ename}, $v{depth+1}, $v{conds.toInt()}); return $i{ename}; });
+				$v = $ctx.getArray(function() { hxbit.Macros.unserializeValue($ctx, @:pos(v.pos) $i{ename}, $v{depth+1}, $v{conds.toInt()}); return $i{ename}; });
 			};
 		case PVector(at):
 			var at = toProxy(at);
@@ -730,7 +823,7 @@ class Macros {
 			var ename = "e" + depth;
 			return macro {
 				var $ename : $at;
-				$v = $ctx.getVector(function() { hxbit.Macros.unserializeValue($ctx, $i{ename}, $v{depth+1}, $v{conds.toInt()}); return $i{ename}; });
+				$v = $ctx.getVector(function() { hxbit.Macros.unserializeValue($ctx, @:pos(v.pos) $i{ename}, $v{depth+1}, $v{conds.toInt()}); return $i{ename}; });
 			};
 		case PSerializable(_):
 			function loop(t:ComplexType) {
@@ -778,21 +871,41 @@ class Macros {
 			};
 		case PCustom:
 			return macro $v = $ctx.getCustom();
-		case PStruct(name,_):
-			var cexpr = Context.parse(t.t.toString(), v.pos);
+		case PStruct(name):
+			var ct = Context.resolveType(t.t, v.pos);
+			var cexpr = switch( Context.followWithAbstracts(ct) ) {
+			case TInst(c, _): getBaseStructPath(c);
+			default: throw "assert";
+			}
 			return macro {
 				if( $ctx.getByte() == 0 )
 					$v = null;
 				else {
 					@:privateAccess $ctx.inPos--;
-					var tmp = Type.createEmptyInstance($cexpr);
-					tmp.unserialize($ctx);
-					$v = tmp;
+					$v = @:privateAccess cast $cexpr.doUnserialize($ctx);
 				}
 			}
-		case PUnknown:
+		case PUnknown, POldStruct(_), PRPC(_):
 			throw "assert";
 		}
+	}
+
+	static function getBaseStructPath( c : Ref<ClassType> ) {
+		var cs = c.get();
+		while( cs.superClass != null ) {
+			if( !isStructSerializable(cs.superClass.t) )
+				break;
+			var c = cs.superClass.t.get();
+			if( c.meta.has(":skipSerialize") )
+				break;
+			cs = c;
+		}
+		if( cs.isPrivate )
+			return macro $i{cs.name}
+		var path = cs.module.split(".");
+		path.unshift("std");
+		path.push(cs.name);
+		return macro $p{path};
 	}
 
 	static function withPos( e : Expr, p : Position ) {
@@ -816,7 +929,7 @@ class Macros {
 
 	static function clearExpr( expr : Expr, t : PropType, pos : Position, fset : Expr -> Expr ) {
 		switch( t.d ) {
-		case PInt, PFloat, PBool, PString, PBytes, PInt64, PFlags(_), PUnknown, PAliasCDB(_):
+		case PInt, PFloat, PDouble, PBool, PString, PBytes, PInt64, PFlags(_), PUnknown, PAliasCDB(_), POldStruct(_), PRPC(_):
 			return null;
 		case PSerializable(_), PSerInterface(_):
 			return macro if( $expr != null ) {
@@ -897,12 +1010,18 @@ class Macros {
 		if( cl.isInterface || cl.meta.has(":skipSerialize") )
 			return null;
 		var fields = Context.getBuildFields();
+		var pos = Context.currentPos();
 		var toSerialize = [];
 		var addCustomSerializable = false;
 		var addCustomUnserializable = false;
 
 		var sup = cl.superClass;
 		var isSubSer = sup != null && isSerializable(sup.t);
+		if( isStruct ) {
+			if( isSubSer )
+				Context.error("StructSerializable cannot extend Serializable", pos);
+			isSubSer = sup != null && isStructSerializable(sup.t) && !sup.t.get().meta.has(":skipSerialize");
+		}
 		var hasNonSerializableParent = sup != null && !isSerializable(sup.t);
 		var serializePriority = null;
 
@@ -960,120 +1079,123 @@ class Macros {
 			}
 		}
 
-		var pos = Context.currentPos();
 		// todo : generate proper generic static var ?
 		// this is required for fixing conflicting member var / package name
 		var useStaticSer = cl.params.length == 0 && !isStruct;
 		var el = [], ul = [], serializePriorityFuns = null;
 
-		if( isStruct ) {
-			ul.push(macro var __bits = __ctx.getInt());
-			ul.push(macro __bits--);
-			el.push(macro var __bits = 0);
-			var bit = 0, elAfter = [];
-			var conds = new haxe.EnumFlags<Condition>();
-			conds.set(PreventCDB);
-			conds.set(PartialResolution);
-			for( s in toSerialize ) {
-				var f = s.f;
-				var fname = f.name;
-				var vt = switch( f.kind ) {
-				case FVar(t,_), FProp(_,_,t): t;
-				default: null;
-				}
-				if( vt == null ) Context.error("Type required", pos);
-				var tt = Context.resolveType(vt, pos);
-				var ftype = getPropField(tt, f.meta, conds);
-				if( ftype == null )
-					Context.error("Unsupported serializable type "+tt.toString(), pos);
+		if( isStruct && !isSubSer ) {
+			var name = getNativePath(cl);
+			el.push(macro @:privateAccess __ctx.usedStructs[$v{name}] = true);
+			el.push(macro __ctx.addByte(getCLID()));
+		}
 
-				var sexpr = macro @:pos(pos) hxbit.Macros.serializeValue(__ctx,this.$fname);
-				var uexpr = macro @:pos(pos) hxbit.Macros.unserializeValue(__ctx,this.$fname);
-				if( isNullable(ftype) ) {
-					var b = bit++;
-					if( b == 31 ) Context.error("Too many nullable fields", pos);
-					el.push(macro @:pos(pos) if( this.$fname == null ) __bits |= 1 << $v{b});
-					sexpr = macro @:pos(pos) if( this.$fname != null ) $sexpr;
-					uexpr = macro @:pos(pos) if( __bits & (1 << $v{b}) == 0 ) $uexpr;
+		for( f in toSerialize ) {
+			var fname = f.f.name;
+			var pos = f.f.pos;
+			var ef = useStaticSer && f.f != serializePriority ? macro @:pos(pos) __this.$fname : macro @:pos(pos) this.$fname;
+			var sexpr = macro @:pos(pos) hxbit.Macros.serializeValue(__ctx,$ef);
+			var uexpr = macro @:pos(pos) hxbit.Macros.unserializeValue(__ctx, $ef);
+			var vis = null, noSave = false;
+			for( m in f.meta ) {
+				switch( m.name ) {
+				case ":visible":
+					vis = getVisibility(m);
+				case ":noSave":
+					noSave = true;
 				}
-				if( ftype.d.match(PNoSave(_)) ) {
-					sexpr = macro @:pos(pos) if( !ctx.forSave ) $sexpr;
-					uexpr = macro @:pos(pos) if( !ctx.forSave ) $uexpr;
-				}
-				elAfter.push(sexpr);
-				ul.push(uexpr);
 			}
-			el.push(macro __ctx.addInt(__bits + 1));
-			el = el.concat(elAfter);
-		} else {
-			for( f in toSerialize ) {
-				var fname = f.f.name;
-				var ef = useStaticSer && f.f != serializePriority ? macro __this.$fname : macro this.$fname;
-				var pos = f.f.pos;
-				var sexpr = macro @:pos(pos) hxbit.Macros.serializeValue(__ctx,$ef);
-				var uexpr = macro @:pos(pos) hxbit.Macros.unserializeValue(__ctx, $ef);
-				var vis = null, noSave = false;
-				for( m in f.meta ) {
-					switch( m.name ) {
-					case ":visible":
-						vis = getVisibility(m);
-					case ":noSave":
-						noSave = true;
-					}
-				}
-				if( vis != null ) {
-					sexpr = macro if( @:privateAccess __ctx.visibilityGroups & (1<<$v{vis}) != 0 ) $sexpr;
-					uexpr = macro if( @:privateAccess __ctx.visibilityGroups & (1<<$v{vis}) != 0 ) $uexpr else $ef = cast null;
-				}
-				if( noSave ) {
-					sexpr = macro if( !__ctx.forSave ) $sexpr;
-					uexpr = macro if( !__ctx.forSave ) $uexpr;
-				}
-				if( f.f == serializePriority ) {
-					if( serializePriorityFuns != null ) throw "assert";
-					serializePriorityFuns = { ser : sexpr, unser : uexpr };
-				} else {
-					el.push(sexpr);
-					ul.push(uexpr);
-				}
+			if( vis != null ) {
+				sexpr = macro if( @:privateAccess __ctx.visibilityGroups & (1<<$v{vis}) != 0 ) $sexpr;
+				uexpr = macro if( @:privateAccess __ctx.visibilityGroups & (1<<$v{vis}) != 0 ) $uexpr else $ef = cast null;
+			}
+			if( noSave ) {
+				sexpr = macro if( !__ctx.forSave ) $sexpr;
+				uexpr = macro if( !__ctx.forSave ) $uexpr;
+			}
+			if( f.f == serializePriority ) {
+				if( serializePriorityFuns != null ) throw "assert";
+				serializePriorityFuns = { ser : sexpr, unser : uexpr };
+			} else {
+				el.push(sexpr);
+				ul.push(uexpr);
 			}
 		}
 
 		var noCompletion = [{ name : ":noCompletion", pos : pos }];
 		var access = [APublic];
 		if( isStruct ) {
-			if( isSubSer )
-				Context.error("StructSerializable cannot extend Serializable", pos);
-			cl.meta.add(":final",[], pos);
 			var isProxy = cl.meta.has(":isProxy");
 			if( !isProxy && cl.superClass != null && cl.superClass.t.get().meta.has(":isProxy") ) {
 				isProxy = true;
 				cl.meta.add(":isProxy",[], pos);
 			}
 			if( isProxy ) {
+				var proxyInits = [];
+				var conds = new haxe.EnumFlags<Condition>();
+				conds.set(PreventCDB);
+				conds.set(PartialResolution);
 				for( s in toSerialize ) {
+					var vt = switch( s.f.kind ) {
+					case FVar(t,_), FProp(_,_,t): t;
+					default: null;
+					}
+					if( vt == null ) Context.error("Type required", pos);
+					var tt = Context.resolveType(vt, pos);
+					var ft = getPropField(tt, s.f.meta, conds);
+					if( ft == null )
+						Context.error("Unsupported serializable type "+tt.toString(), pos);
+					checkProxy(ft);
+					var t = ft.t;
 					switch( s.f.kind ) {
 					case FProp(_):
 						Context.error("Property not allowed on proxy StructSerializable", s.f.pos);
-					case FVar(t,e):
-						s.f.kind = FProp("default","set", t, e);
+					case FVar(_,e):
 						var fname = s.f.name;
+						var expr;
+						if( ft.isProxy ) {
+							expr = macro { mark(); if( this.$fname != null ) this.$fname.unbindHost(); this.$fname = v; if( v != null ) v.bindHost(this,0); return v; }
+							if( e != null ) {
+								proxyInits.push(macro @:pos(e.pos) this.$fname = $e);
+								e = null;
+							}
+						} else {
+							expr = macro { mark(); this.$fname = v; return v; }
+						}
+						s.f.kind = FProp("default","set", t, e);
 						fields.push({
 							name : "set_"+fname,
 							access : [AInline],
 							pos : s.f.pos,
 							kind : FFun({
 								args : [{ name : "v", type : t }],
-								expr : macro { this.$fname = v; mark(); return v; }
+								expr : expr,
 							})
 						});
 					default:
 					}
 				}
+				if( proxyInits.length > 0 ) {
+					var found = false;
+					for( f in fields )
+						if( f.name == "new" ) {
+							switch( f.kind ) {
+							case FFun(f):
+								f.expr = macro { $b{proxyInits}; ${f.expr}; };
+								found = true;
+							default:
+							}
+							break;
+						}
+					if( !found )
+						Context.error("Proxy initialisation requires expliciti class constructor", proxyInits[0].pos);
+				}
 			}
-		} else if( isSubSer )
+		}
+
+		if( isSubSer )
 			access.push(AOverride);
-		else {
+		else if( !isStruct ) {
 			fields.push({
 				name : "__uid",
 				pos : pos,
@@ -1093,22 +1215,78 @@ class Macros {
 		}
 
 		var clName = StringTools.endsWith(cl.module,"."+cl.name) ? cl.module.split(".") : [cl.name];
-		if( !isStruct ) {
-			fields.push({
-				name : "__clid",
-				pos : pos,
-				access : [AStatic],
-				meta : noCompletion,
-				kind : FVar(macro : Int, macro @:privateAccess hxbit.Serializer.registerClass($p{clName})),
-			});
-			fields.push({
-				name : "getCLID",
-				pos : pos,
-				access : access,
-				meta : noCompletion,
-				kind : FFun({ args : [], ret : macro : Int, expr : macro return __clid }),
-			});
+		var regClass = macro @:privateAccess hxbit.Serializer.registerClass($p{clName});
+		if( isStruct ) {
+			var basePath;
+			if( !isSubSer ) {
+				var name = getNativePath(cl);
+				fields.push({
+					name : "__variants",
+					pos : pos,
+					access : [AStatic],
+					meta : noCompletion,
+					kind : FVar((macro : Array<Class<hxbit.StructSerializable>>), (macro [])),
+				});
+				fields.push({
+					name : "doUnserialize",
+					pos : pos,
+					access : [AStatic],
+					meta : noCompletion,
+					kind : FFun({
+						args : [ { name : "ctx", type : macro : hxbit.Serializer } ],
+						ret : null,
+						expr : macro {
+							var clid = ctx.getByte() - 1;
+							if( clid < 0 ) return null;
+							var conv = @:privateAccess ctx.typeConvert[$v{name}];
+							if( conv != null && conv.constructs[clid] != null ) return @:privateAccess ctx.convertType(conv);
+							var cl = __variants[clid];
+							var v = Type.createEmptyInstance(cl);
+							v.unserialize(ctx);
+							return v;
+						},
+					}),
+				});
+				fields.push({
+					name : "getMultiSchema",
+					pos : pos,
+					access : [AStatic],
+					meta : noCompletion,
+					kind : FFun({
+						args : [{ name : "forSave", type : macro : Bool, opt : true, value : macro true }],
+						ret : null,
+						expr : macro {
+							var s = new hxbit.Schema();
+							for( v in __variants ) {
+								var sv = Type.createEmptyInstance(v).getSerializeSchema(forSave);
+								s.fieldsNames.push(Type.getClassName(v));
+								s.fieldsTypes.push(PObj([for( i => t in sv.fieldsTypes ) { name : sv.fieldsNames[i], type : t, opt : false }]));
+							}
+							return s;
+						}
+					}),
+				});
+				basePath = macro $i{cl.name};
+			} else {
+				basePath = getBaseStructPath(Context.getLocalClass());
+			}
+			regClass = macro @:privateAccess hxbit.Serializer.registerVariant($basePath,$p{clName});
 		}
+
+		fields.push({
+			name : "__clid",
+			pos : pos,
+			access : [AStatic],
+			meta : noCompletion,
+			kind : FVar(macro : Int, regClass),
+		});
+		fields.push({
+			name : "getCLID",
+			pos : pos,
+			access : access,
+			meta : noCompletion,
+			kind : FFun({ args : [], ret : macro : Int, expr : macro return __clid }),
+		});
 
 		var needSerialize = toSerialize.length != 0 || !isSubSer || addCustomSerializable;
 		var needUnserialize = needSerialize || fieldsInits.length != 0 || addCustomUnserializable;
@@ -1183,7 +1361,7 @@ class Macros {
 				access : access,
 				meta : noCompletion,
 				kind : FFun({
-					args : [{ name : "forSave", type : macro : Bool, value : macro true }],
+					args : [{ name : "forSave", type : macro : Bool, opt : true, value : macro true }],
 					ret : null,
 					expr : macro {
 						var schema = ${if( isSubSer ) macro super.getSerializeSchema(forSave) else macro new hxbit.Schema()};
@@ -1213,7 +1391,7 @@ class Macros {
 					pos : pos,
 					access : access,
 					kind : FFun({
-						args : [{ name : "mark", type : macro : hxbit.Serializable.MarkInfo },{ name : "from", type : macro : hxbit.NetworkSerializable }],
+						args : [{ name : "mark", type : macro : hxbit.Serializable.MarkInfo },{ name : "from", type : macro : hxbit.Serializable.MarkParam }],
 						expr : code,
 					}),
 				});
@@ -1340,6 +1518,8 @@ class Macros {
 					Context.error("Too many constructors", pos);
 				var conds = new haxe.EnumFlags<Condition>();
 				conds.set(PreventCDB);
+				if( e.meta.has(":rpcValue") )
+					conds.set(IsParam);
 				if( e.meta.has(":allowCDB") || e.meta.has(":cdb") )
 					conds.unset(PreventCDB);
 				for( f in e.names ) {
@@ -1360,7 +1540,7 @@ class Macros {
 							var aname = "_" + a.name;
 							var at = haxe.macro.TypeTools.applyTypeParameters(a.t,e.params,tparams).toComplexType();
 							evals.push(macro var $aname : $at);
-							evals.push(macro @:pos(e.pos) hxbit.Macros.unserializeValue(ctx,$i{aname},0,$v{conds.toInt()}));
+							evals.push(macro @:pos(e.pos) hxbit.Macros.unserializeValue(ctx, @:pos(pos) $i{aname}, 0, $v{conds.toInt()}));
 							etypes.push(macro { name : $v{a.name}, type : { var v : $at; hxbit.Macros.getFieldType(v); }, opt : $v{a.opt} });
 						}
 						evals.push({ expr : ECall({ expr : EConst(CIdent(c.name)), pos : pos },[for( a in args ) { expr : EConst(CIdent("_"+a.name)), pos : pos }]), pos : pos });
@@ -1408,8 +1588,8 @@ class Macros {
 								var b = ctx.getByte();
 								if( b == 0 )
 									return null;
-								var conv = @:privateAccess ctx.enumConvert[$v{pathName}];
-								if( conv != null && conv.constructs[b-1] != null ) return ctx.convertEnum(conv);
+								var conv = @:privateAccess ctx.typeConvert[$v{pathName}];
+								if( conv != null && conv.constructs[b-1] != null ) return ctx.convertType(conv);
 								return ${{ expr : ESwitch(macro b,ucases,macro throw "Invalid enum index "+b), pos : pos }}
 							},
 							ret : pt.toComplexType(),
@@ -1453,7 +1633,7 @@ class Macros {
 						meta : [],
 						pos : pos,
 						kind : FFun( {
-							args : [{ name : "value", type : pt.toComplexType() },{ name : "mark", type : macro : hxbit.Serializable.MarkInfo },{ name : "from", type : macro : hxbit.NetworkSerializable }],
+							args : [{ name : "value", type : pt.toComplexType() },{ name : "mark", type : macro : hxbit.Serializable.MarkInfo },{ name : "from", type : macro : hxbit.Serializable.MarkParam }],
 							expr : macro doMarkReferences(value, mark, from),
 							ret : null,
 						}),
@@ -1462,7 +1642,7 @@ class Macros {
 						access : [AStatic],
 						pos : pos,
 						kind : FFun({
-							args : [{ name : "value", type : pt.toComplexType() },{ name : "mark", type : macro : hxbit.Serializable.MarkInfo },{ name : "from", type : macro : hxbit.NetworkSerializable }],
+							args : [{ name : "value", type : pt.toComplexType() },{ name : "mark", type : macro : hxbit.Serializable.MarkInfo },{ name : "from", type : macro : hxbit.Serializable.MarkParam }],
 							expr : {
 								var cases = [];
 								var conds = new haxe.EnumFlags<Condition>();
@@ -1471,7 +1651,9 @@ class Macros {
 									case TFun(args,_):
 										var marks = [], eargs = [];
 										for( a in args ) {
-											var arg = macro $i{a.name};
+											var name = a.name;
+											if( name == "from" ) name = "__from";
+											var arg = macro $i{name};
 											marks.push(macro hxbit.Macros.markValue($arg));
 											eargs.push(arg);
 										}
@@ -1568,7 +1750,7 @@ class Macros {
 		switch( t.d ) {
 		case PMap(_), PArray(_), PObj(_), PVector(_), PFlags(_):
 			return !t.notMutable;
-		case PNull(st), PAlias(st):
+		case PNull(st), PAlias(st), PNoSave(st):
 			return !t.notMutable && needProxy(st);
 		default:
 			return false;
@@ -1631,6 +1813,15 @@ class Macros {
 		}
 	}
 
+	static function replaceDo( e:Expr ) {
+		switch(e.expr) {
+		case EMeta({ name: ":do" }, doBody):
+			e.expr = EIf(macro __do, doBody, null);
+		default:
+			haxe.macro.ExprTools.iter(e, replaceDo);
+		}
+	}
+
 	static function superImpl( name : String, e : Expr ) {
 		switch( e.expr ) {
 		case EField( esup = { expr : EConst(CIdent("super")) }, fname) if( fname == name ):
@@ -1657,7 +1848,7 @@ class Macros {
 			return null;
 
 		var clName = Context.getLocalClass().toString();
-		NW_BUILD_STACK.push(clName);
+		SERIALIZABLES.set(clName, getNativePath(cl));
 
 		if(fields == null)
 			fields = Context.getBuildFields();
@@ -1757,8 +1948,9 @@ class Macros {
 						case EConst(CIdent("server")): mode = Server;
 						case EConst(CIdent("owner")): mode = Owner;
 						case EConst(CIdent("immediate")): mode = Immediate;
+						case EConst(CIdent("checked")): mode = Checked;
 						default:
-							Context.error("Unexpected Rpc mode : should be all|clients|server|owner|immediate", meta.params[0].pos);
+							Context.error("Unexpected Rpc mode : should be all|clients|server|owner|immediate|checked", meta.params[0].pos);
 						}
 					rpc.push( { f : f, mode:mode } );
 					superRPC.set(f.name, true);
@@ -1785,8 +1977,8 @@ class Macros {
 				@:noCompletion public var __bits2 : Int = 0;
 				@:noCompletion public var __next : hxbit.NetworkSerializable;
 				#if hxbit_visibility
-				@:noCompletion public var __cachedVisibility : Map<hxbit.NetworkSerializable,Int>;
-				@:noCompletion public var __dirtyVisibilityGroups : Int;
+				@:noCompletion public var __dirtyVisibilityGroups : Int = 0;
+				@:noCompletion public var __visibilityCount : Int = -1; // will get 0 when replicated
 				#end
 				@:noCompletion public function networkSetBit( b : Int ) {
 					if( __host != null && @:privateAccess __host.checkSyncingProperty(b) && (__host.isAuth || @:privateAccess __host.checkWrite(this,b)) && (__next != null || @:privateAccess __host.mark(this)) ) {
@@ -1823,7 +2015,7 @@ class Macros {
 					__host = old;
 				}
 				#if hxbit_visibility
-				public inline function setVisibilityDirty( group : hxbit.VisibilityGroup ) {
+				public function setVisibilityDirty( group : hxbit.VisibilityGroup ) {
 					__dirtyVisibilityGroups |= 1 << group.getIndex();
 					if( __next == null && __host != null ) @:privateAccess __host.mark(this);
 				}
@@ -2026,41 +2218,60 @@ class Macros {
 
 		// BUILD RPC
 		var firstRPCID = rpcID;
-		var rpcCases = [];
+		var rpcCases = [], rpcSchema = [];
 		for( r in rpc ) {
 			switch( r.f.kind ) {
 			case FFun(f):
 				var id = rpcID++;
+				if( r.mode == Checked ) {
+					var body = switch( f.expr.expr ) { case EBlock(el): el; default: null; };
+					var last = body == null ? null : body[body.length-1];
+					if( last != null && last.expr.match(EMeta({ name : ":do" }, _)) ) {
+						if( f.ret == null )
+							Context.error("Checked RPC ending with @:do requires an explicit return type", r.f.pos);
+						var v = getSuccessVal(Context.resolveType(f.ret, r.f.pos));
+						body.push(macro return $v);  // allow last return to be inside the @:do block
+					}
+				}
 				var returnVal = hasReturnVal(f.expr);
 				var name = r.f.name;
 				var p = r.f.pos;
 				var retType = f.ret;
 				r.f.name += "__impl";
 
-				var cargs = [for( a in f.args ) { expr : EConst(CIdent(a.name)), pos : p } ];
-				var fcall = { expr : ECall( { expr : EField( { expr : EConst(CIdent("this")), pos:p }, r.f.name), pos : p }, cargs), pos : p };
+				var rpcArgs = f.args.copy();
+				var funArgs = rpcArgs;
+
+				var cargs = [for( a in rpcArgs ) { expr : EConst(CIdent(a.name)), pos : p } ];
+
+				if (r.mode == Checked) {
+					f.args.unshift({ name: "__do", type: macro : Bool });
+					cargs.unshift(macro true);
+				}
+				var implFunc = { expr : EField( { expr : EConst(CIdent("this")), pos:p }, r.f.name), pos : p };
+				var fcall = { expr : ECall(implFunc, cargs), pos : p };
 
 				var doCall = fcall;
-				var rpcArgs = f.args;
-				var funArgs = f.args;
 				var resultCall = macro null;
 
 				var conds = new haxe.EnumFlags<Condition>();
 				conds.set(PreventCDB);
-				var visibilityMask = 0;
-				for( m in r.f.meta ) {
+				conds.set(IsParam);
+				for( m in r.f.meta )
 					if( m.name == ":allowCDB" )
 						conds.unset(PreventCDB);
 					if( m.name == ":visible" )
 						visibilityMask |= 1 << getVisibility(m);
 				}
 
-				if( returnVal.value || returnVal.call ) {
+				if(r.mode == Checked)
+					replaceDo(f.expr);
+
+				var hasResult = returnVal.value || returnVal.call;
+				if( hasResult ) {
 					var typeValue;
 					if( returnVal.call ) {
 						replaceReturns(f.expr);
-						rpcArgs = f.args.copy();
-						funArgs = f.args.copy();
 						f.ret = macro : Void;
 						cargs.push(macro onResult);
 						f.args.push({ name : "__return" });
@@ -2088,17 +2299,25 @@ class Macros {
 					rpcArgs.push( { name : "onResult", opt: true, type: retType == null ? null : TFunction([retType], macro:Void) } );
 				}
 
+				var beforeRPC = macro @:privateAccess __host.beforeRPC(this,$v{id});
+				var serializeRPC = macro function(__ctx) {
+					$b{[
+						for( a in funArgs )
+							withPos(macro hxbit.Macros.serializeValue(__ctx, $i{a.name}), f.expr.pos)
+					]};
+				};
 				var forwardRPC = macro {
-					@:privateAccess __host.doRPC(this,$v{id}, $v{visibilityMask}, $resultCall, function(__ctx) {
-						$b{[
-							for( a in funArgs )
-								withPos(macro hxbit.Macros.serializeValue(__ctx, $i{a.name}), f.expr.pos)
-						] };
-					});
+					$beforeRPC;
+					@:privateAccess __host.doRPC(this,$v{id},$resultCall,$serializeRPC);
+				};
+				var forwardClient = macro {
+					@:privateAccess __host.targetRPC(this,$v{id},$resultCall,$serializeRPC,client);
 				};
 
-				if( (returnVal.value || returnVal.call) && r.mode != Server && r.mode != Owner )
-					Context.error("Cannot use return value with default rpc mode, use @:rpc(server) or @:rpc(owner)", r.f.pos);
+				if( hasResult && r.mode != Server && r.mode != Checked && r.mode != Owner )
+					Context.error("Cannot use return value with default rpc mode, use @:rpc(server/owner/checked)", r.f.pos);
+
+				doCall = wrapRPC(r, doCall, id);
 
 				var rpcExpr = switch( r.mode ) {
 				case All:
@@ -2122,7 +2341,7 @@ class Macros {
 						}
 						$doCall;
 					}
-				case Server:
+				case Server|Checked:
 					macro {
 						if( __host == null ) return; // not shared object --> no server
 						if( !__host.isAuth ) {
@@ -2142,11 +2361,10 @@ class Macros {
 							return; // no distant target possible (networkAllow = false)
 						if( __host.isAuth ) {
 							// multiple forward possible
+							$beforeRPC;
 							@:privateAccess __host.dispatchClients(function(client) {
-								if( networkAllow(Ownership,$v{id},client.ownerObject) && __host.setTargetOwner(client.ownerObject) ) {
-									$forwardRPC;
-									__host.setTargetOwner(null);
-								}
+								if( networkAllow(Ownership,$v{id},client.ownerObject) )
+									$forwardClient;
 							});
 							if( networkAllow(Ownership, $v{id}, __host.self.ownerObject) )
 								$doCall;
@@ -2186,6 +2404,49 @@ class Macros {
 				};
 				fields.push(rpc);
 
+				if( r.mode == Checked ) {
+					var capitalized = name.charAt(0).toUpperCase() + name.substr(1);
+					var cargs = [for( a in funArgs ) { expr : EConst(CIdent(a.name)), pos : p } ];
+					cargs.unshift(macro false);
+					var implCall = withPos(macro $implFunc($a{cargs}), p);
+					var doArgs = cargs.copy();
+					doArgs[0] = macro true;
+					var doCall = withPos(macro $implFunc($a{doArgs}), p);
+					fields.push({
+						name : "check" + capitalized,
+						pos : p,
+						access : [APublic, AFinal],
+						kind : FFun({
+							args: funArgs,
+							params: [],
+							expr : macro return $implCall,
+						}),
+					});
+					fields.push({
+						name : "can" + capitalized,
+						pos : p,
+						access : [APublic, AFinal],
+						kind : FFun({
+							args: funArgs,
+							params: [],
+							expr : macro return hxbit.Macros.checkSuccess($implCall),
+						}),
+					});
+					fields.push({
+						name : "do" + capitalized,
+						pos : p,
+						access : [APublic, AFinal],
+						kind : FFun({
+							args: funArgs,
+							params: [],
+							expr : macro {
+								if( __host != null && !__host.isAuth ) throw "Cannot execute " + $v{name} + " synchronously on a client";
+								return $doCall;
+							},
+						}),
+					});
+				}
+
 				r.f.access.remove(APublic);
 				r.f.meta.push( { name : ":noCompletion", pos : p } );
 
@@ -2196,18 +2457,79 @@ class Macros {
 				} else
 					exprs.push(macro if( false ) $fcall); // force typing
 				for( a in funArgs ) {
-					var e = macro hxbit.Macros.unserializeValue(__ctx, $i{ a.name }, 0, $v{conds.toInt()});
+					var e = macro hxbit.Macros.unserializeValue(__ctx, @:pos(p) $i{ a.name }, 0, $v{conds.toInt()});
 					e.pos = p;
 					exprs.push(e);
 				}
 				exprs.push(macro if( __ctx.error ) return false);
 				exprs.push(macro if( __host != null ) __host.makeAlive());
+
+				rpcSchema.push(macro { schema.fieldsNames.push($v{name}); schema.fieldsTypes.push(hxbit.Macros.getRPCFieldType($i{r.f.name},$v{r.mode.getIndex()})); });
+
+				// -- when receiving the rpc, check for additional security
+
+				switch( r.mode ) {
+				case All:
+					exprs.push(macro {
+						if( __host != null && __host.isAuth ) {
+							// check again
+							if( !networkAllow(RPC,$v{id},__host.rpcClient.ownerObject) )
+								return false;
+							$forwardRPC;
+						}
+					});
+				case Owner:
+					// check again when receiving the RPC if we are on the good owner
+					// the server might relay to the actual owner or simply drop if not connected
+					exprs.push(macro {
+						if( __host != null && __host.isAuth ) {
+							// check again
+							if( !networkAllow(RPC, $v{id}, __host.rpcClient.ownerObject) )
+								return false;
+							// multiple forward possible
+							$beforeRPC;
+							@:privateAccess __host.dispatchClients(function(client) {
+								if( networkAllow(Ownership,$v{id},client.ownerObject) ) {
+									// ignore result from clients if another client dispatched the call
+									${if( hasResult ) macro var onResult = null else macro null};
+									$forwardClient;
+								}
+							});
+							// only execute if ownership
+							if( !networkAllow(Ownership, $v{id}, __host.self.ownerObject) )
+								return true;
+						}
+					});
+				case Clients:
+					exprs.push(macro {
+						if( __host != null && __host.isAuth ) return false;
+					});
+				case Server | Checked	:
+					exprs.push(macro {
+						if( __host == null || !__host.isAuth || !networkAllow(RPCServer, $v{id}, __host.rpcClient.ownerObject) )
+							return false;
+					});
+				case Immediate:
+					exprs.push(macro {
+						if( __host != null && __host.isAuth ) {
+							// check again
+							if( !networkAllow(Ownership,$v{id},__host.rpcClient.ownerObject) )
+								return false;
+							$beforeRPC;
+							@:privateAccess __host.dispatchClients(function(client) {
+								if( client != __host.rpcClient )
+									$forwardClient;
+							});
+						}
+					});
+				}
+
 				if( returnVal.call ) {
 					exprs.push(macro {
 						var __res = @:privateAccess __clientResult.beginAsyncRPCResult(null);
 						function onResult(v) {
 							if( false ) v = __v;
-							@:privateAccess __clientResult.beginAsyncRPCResult(__res);
+							@:privateAccess if( __clientResult.beginAsyncRPCResult(__res) == null ) return;
 							hxbit.Macros.serializeValue(__ctx, v);
 							@:privateAccess __clientResult.endAsyncRPCResult();
 						}
@@ -2219,70 +2541,8 @@ class Macros {
 						@:privateAccess __clientResult.beginRPCResult();
 						hxbit.Macros.serializeValue(__ctx, result);
 					});
-				} else {
-
-					// -- when receiving the rpc, check for additional security
-
-					switch( r.mode ) {
-					case All:
-						exprs.push(macro {
-							if( __host != null && __host.isAuth ) {
-								// check again
-								if( !networkAllow(RPC,$v{id},__host.rpcClient.ownerObject) )
-									return false;
-								$forwardRPC;
-							}
-							$fcall;
-						});
-					case Owner:
-						// check again when receiving the RPC if we are on the good owner
-						// the server might relay to the actual owner or simply drop if not connected
-						exprs.push(macro {
-							if( __host != null && __host.isAuth ) {
-								// check again
-								if( !networkAllow(RPC, $v{id}, __host.rpcClient.ownerObject) )
-									return false;
-								// multiple forward possible
-								@:privateAccess __host.dispatchClients(function(client) {
-									if( networkAllow(Ownership,$v{id},client.ownerObject) && __host.setTargetOwner(client.ownerObject) ) {
-										$forwardRPC;
-										__host.setTargetOwner(null);
-									}
-								});
-								// only execute if ownership
-								if( !networkAllow(Ownership, $v{id}, __host.self.ownerObject) )
-									return true;
-							}
-							$fcall;
-						});
-					case Clients:
-						exprs.push(macro {
-							$fcall;
-						});
-					case Server:
-						exprs.push(macro {
-							if( __host == null || !__host.isAuth || !networkAllow(RPCServer, $v{id}, __host.rpcClient.ownerObject) )
-								return false;
-							$fcall;
-						});
-					case Immediate:
-						exprs.push(macro {
-							if( __host != null && __host.isAuth ) {
-								// check again
-								if( !networkAllow(Ownership,$v{id},__host.rpcClient.ownerObject) )
-									return false;
-
-								@:privateAccess __host.dispatchClients(function(client) {
-									if(client != __host.rpcClient && __host.setTargetOwner(client.ownerObject) ) {
-										$forwardRPC;
-										__host.setTargetOwner(null);
-									}
-								});
-							}
-							$fcall;
-						});
-					}
-				}
+				} else
+					exprs.push(fcall);
 
 				rpcCases.push({ values : [{ expr : EConst(CInt(""+id)), pos : p }], guard : null, expr : { expr : EBlock(exprs), pos : p } });
 
@@ -2403,7 +2663,7 @@ class Macros {
 			#if hxbit_visibility
 				var gexprs = [], eexprs = [];
 				if( groups.keys().hasNext() ) {
-					gexprs.push(macro var groups : Int = __cachedVisibility == null ? 0 : __cachedVisibility.get(from));
+					gexprs.push(macro var groups : Int = from.get(this));
 				}
 				for( gid => info in groups ) {
 					gexprs.push(macro if( groups & $v{1<<gid} != 0 ) $b{[for( f in info.fl ) {
@@ -2428,7 +2688,7 @@ class Macros {
 					kind : FFun({
 						args : [
 							{ name : "mark", type : macro : hxbit.Serializable.MarkInfo },
-							{ name : "from", type : macro : hxbit.NetworkSerializable },
+							{ name : "from", type : macro : hxbit.Serializable.MarkParam },
 						],
 						ret : null,
 						expr : code,
@@ -2512,6 +2772,23 @@ class Macros {
 					expr : if( isSubSer && firstRPCID > 0 ) macro { if( __id < $v { firstRPCID } ) return super.networkRPC(__ctx, __id, __clientResult); $swExpr; return true; } else macro { $swExpr; return true; }
 				}),
 			});
+
+
+			fields.push({
+				name : "getRPCSchema",
+				pos : pos,
+				access : access,
+				meta : noComplete,
+				kind : FFun({
+					args : [],
+					ret : macro : hxbit.Schema,
+					expr : macro {
+						var schema = ${if( isSubSer ) macro super.getRPCSchema() else macro new hxbit.Schema()};
+						$b{rpcSchema};
+						return schema;
+					}
+				}),
+			});
 		}
 
 
@@ -2557,13 +2834,12 @@ class Macros {
 		if( toSerialize.length > 0 )
 			cl.meta.add(":sFields", [for( r in toSerialize ) { expr : EConst(CIdent(r.f.name)), pos : pos }], pos);
 
-		NW_BUILD_STACK.pop();
 		return fields;
 	}
 
 	static function makeRecExpr( expr : Expr, t : PropType, pos : Position, mk : Expr -> PropType -> Expr ) {
 		switch( t.d ) {
-		case PInt, PFloat, PBool, PString, PBytes, PInt64, PFlags(_), PUnknown, PAliasCDB(_):
+		case PInt, PFloat, PDouble, PBool, PString, PBytes, PInt64, PFlags(_), PUnknown, PAliasCDB(_), POldStruct(_), PRPC(_):
 		case PSerializable(_), PSerInterface(_), PStruct(_), PDynamic, PEnum(_), PCustom:
 			return macro if( $expr != null ) ${mk(expr,t)};
 		case PMap(k,v):

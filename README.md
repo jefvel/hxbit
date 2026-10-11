@@ -183,6 +183,7 @@ There are different RPC modes, which can be specified by using `@:rpc(mode)`:
   - `server` : When called on the client: will forward the call the server (if networkAllow(RPCServer) allows it), but not execute locally. When called on the server, will execute locally.
   - `owner` : When called on the client: will forward the call to the server (if networkAllow(RPC) allows it), but not execute locally. When called on the server: will forward the call to the owners as defined by networkAllow(Ownership).
   - `immediate` : Like `all` but executes immediately locally
+  - `checked` : Like `server`, but also generates `check{Name}` and `can{Name}` helper functions
   
 Return values are possible unless you are in `all` mode, and will add an extra callback to capture the result asynchronously:
 
@@ -313,3 +314,43 @@ An example of this would be if a property is only visible for clients in the sam
 available to nearby players.
 
 Note: make sure to call `host.makeAlive()` frequently on the clients, otherwise new objects wont appear until a RPC is called on them.
+
+### Checked RPCs and @:do blocks
+
+The `checked` mode is useful when you want to check on the client whether an RPC will succeed before executing it. It generates two additional functions:
+
+  - `check{Name}(...)` : Runs the RPC logic without executing `@:do` blocks, returning the result
+  - `can{Name}(...)` : Like `check`, but returns a `Bool` indicating success
+
+Use `@:do { }` blocks to mark code that should only run when the RPC succeeds:
+
+```haxe
+@:rpc(checked)
+function buyItem(itemId:Int) : PurchaseResult {
+    var item = inventory.get(itemId);
+    if (item == null) return NotFound;
+    if (player.gold < item.price) return NotEnoughGold;
+    
+    @:do {
+        // This only executes when called via buyItem(), not checkBuyItem()
+        player.gold -= item.price;
+        player.addItem(item);
+    }
+    return Success;
+}
+
+// Usage:
+if (canBuyItem(itemId)) {
+    buyItem(itemId);
+}
+
+// Or check the specific result:
+var result = checkBuyItem(itemId);
+if (result != Success)
+    showError(result);
+```
+
+The `can{Name}` function determines success by:
+  - If return type is `Bool`, returns the value directly
+  - If return type is an enum with `@:rpcSuccess(Value)`, returns `result == Value`
+  - Otherwise, returns `result != null` (result considered an error code)

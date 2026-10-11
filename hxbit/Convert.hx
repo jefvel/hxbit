@@ -52,32 +52,41 @@ class Convert {
 		hadCID = !schema.isFinal;
 		hasCID = !ourSchema.isFinal;
 
+		var defClass = Type.resolveClass(classPath);
+		var defInst : hxbit.Serializable = null;
+		if( defClass != null ) {
+			defInst = Type.createEmptyInstance(defClass);
+			defInst.unserializeInit();
+		}
+
 		var map = new Map();
 		for( i in 0...schema.fieldsNames.length ) {
+			var fname = schema.fieldsNames[i];
 			var oldT = schema.fieldsTypes[i];
-			var newT = ourMap.get(schema.fieldsNames[i]);
-			var c = new ConvertField(classPath+"."+schema.fieldsNames[i],oldT, newT);
+			var newT = ourMap.get(fname);
+			var c = new ConvertField(classPath+"."+fname,oldT, newT);
 			if( newT != null ) {
 				if( sameType(oldT, newT) )
 					c.same = true;
 				else {
 					c.conv = convFuns.get(c.path);
-					c.defaultValue = getDefault(newT);
+					c.defaultValue = getDefault(newT,Reflect.field(defInst,fname));
 				}
 			}
 			c.index = read.length;
 			read.push(c);
-			map.set(schema.fieldsNames[i], c);
+			map.set(fname, c);
 		}
 
 		write = [];
 		for( i in 0...ourSchema.fieldsNames.length ) {
+			var fname = ourSchema.fieldsNames[i];
 			var newT = ourSchema.fieldsTypes[i];
-			var c = map.get(ourSchema.fieldsNames[i]);
+			var c = map.get(fname);
 			if( c == null ) {
 				c = new ConvertField(null, null, newT);
 				// resolve default value using a specific method ?
-				c.defaultValue = getDefault(newT);
+				c.defaultValue = getDefault(newT, Reflect.field(defInst,fname));
 			} else
 				c.written = true;
 			write.push(c);
@@ -123,11 +132,11 @@ class Convert {
 		}
 	}
 
-	public static function getDefault(t:Schema.FieldType) : Dynamic {
+	public static function getDefault(t:Schema.FieldType, defValue:Dynamic) : Dynamic {
 		return switch( t ) {
-		case PInt64: haxe.Int64.make(0, 0);
-		case PInt, PFlags(_): 0;
-		case PFloat: 0.;
+		case PInt64: defValue ?? haxe.Int64.make(0, 0);
+		case PInt, PFlags(_): defValue ?? 0;
+		case PFloat: defValue ?? 0.;
 		case PArray(_): [];
 		case PMap(k, _):
 			switch( k ) {
@@ -136,9 +145,9 @@ class Convert {
 			default: new Map<{},Dynamic>();
 			}
 		case PVector(_): new haxe.ds.Vector<Dynamic>(0);
-		case PBool: false;
-		case PAlias(t), PAliasCDB(t), PNoSave(t): getDefault(t);
-		case PEnum(_), PNull(_), PObj(_), PSerializable(_), PSerInterface(_), PString, PUnknown, PBytes, PDynamic, PCustom, PStruct(_): null;
+		case PBool: defValue ?? false;
+		case PAlias(t), PAliasCDB(t), PNoSave(t): getDefault(t,defValue);
+		default: null;
 		};
 	}
 
@@ -149,34 +158,38 @@ class Convert {
 
 }
 
-class EnumConvert {
+class TypeConvert {
 
-	public var enumClass : String;
+	public var classValue : Dynamic;
 	public var constructs : Array<Convert>;
 	public var reindex : Array<Int>;
+	public var isStruct : Bool;
 
-	public function new( classPath : String, ourSchema : Schema, schema : Schema ) {
-		this.enumClass = classPath;
+	public function new( classPath : String, classValue : Dynamic, ourSchema : Schema, schema : Schema, isStruct ) {
+		this.isStruct = isStruct;
+		this.classValue = classValue;
 		reindex = [];
 		constructs = [];
 
 		for( index => name in schema.fieldsNames ) {
 			var found = false;
 			var from = schema.fieldsTypes[index];
-			for( i => s in ourSchema.fieldsNames )
-				if( s == name ) {
-					reindex.push(i);
-					var to = ourSchema.fieldsTypes[i];
-					if( to == null && from == null && i == index )
-						constructs.push(null);
-					else
-						constructs.push(new Convert(classPath+"."+name, makeSchema(to), makeSchema(from)));
-					found = true;
-					break;
-				}
+			if( ourSchema != null ) {
+				for( i => s in ourSchema.fieldsNames )
+					if( s == name ) {
+						reindex.push(i);
+						var to = ourSchema.fieldsTypes[i];
+						if( to == null && from == null && i == index )
+							constructs.push(null);
+						else
+							constructs.push(new Convert(name.indexOf('.') > 0 ? name : classPath+"."+name, makeSchema(to), makeSchema(from)));
+						found = true;
+						break;
+					}
+			}
 			if( !found ) {
 				reindex.push(-1);
-				constructs.push(new Convert(classPath+"."+name,makeSchema(null),makeSchema(from)));
+				constructs.push(new Convert(name.indexOf('.') > 0 ? name : classPath+"."+name,makeSchema(null),makeSchema(from)));
 			}
 		}
 	}
@@ -188,8 +201,12 @@ class EnumConvert {
 		case PObj(fields):
 			for( i => f in fields ) {
 				s.fieldsTypes.push(f.type);
-				// don't use field name for now : privilege position over name
-				s.fieldsNames.push("@"+i);
+				if( isStruct )
+					s.fieldsNames.push(f.name);
+				else {
+					// don't use field name for now : privilege position over name
+					s.fieldsNames.push("@"+i);
+				}
 			}
 		default: throw "assert";
 		}
