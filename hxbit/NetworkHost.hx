@@ -141,7 +141,7 @@ class NetworkClient {
 						}
 						offs += bit;
 						if( !o.networkAllow(SetField, offs, ownerObject) ) {
-							host.logError("Client setting unallowed property " + o.networkGetName(offs) + " on " + o, o.__uid);
+							host.logError("Client setting unallowed property " + o.networkGetName(offs) + " on " + host.objStr(o), o.__uid);
 							break;
 						}
 						offs++;
