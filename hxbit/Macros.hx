@@ -2260,9 +2260,6 @@ class Macros {
 				for( m in r.f.meta )
 					if( m.name == ":allowCDB" )
 						conds.unset(PreventCDB);
-					if( m.name == ":visible" )
-						visibilityMask |= 1 << getVisibility(m);
-				}
 
 				if(r.mode == Checked)
 					replaceDo(f.expr);
